@@ -223,14 +223,6 @@ git commit -m "feat: add combo multiplier system"
 git push
 ```
 
-### Using with Claude Code (This Terminal)
-
-When you're in a Claude Code session, you can also just **ask me directly**:
-
-> "Commit and push my changes with message 'Fixed timer bug'"
-
-I'll run the git commands for you automatically.
-
 ### Conventional Commit Format
 
 The AI generates messages following [Conventional Commits](https://www.conventionalcommits.org/):
