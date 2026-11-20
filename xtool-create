@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""
+xtool-create: CLI tool to automate iOS app creation with Xcode + xtool + git
+
+This tool automates the workflow:
+1. Creates a new Xcode project from template
+2. Sets up xtool project with symlinks to Swift files
+3. Initializes git repository
+4. Pushes to target directory (~/Documents/xtool-apps/<AppName>)
+"""
+
+import os
+import sys
+import shutil
+import subprocess
+import argparse
+import uuid
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+# Configuration
+# Try multiple locations for templates (installed vs development)
+def _find_templates_dir() -> Path:
+    """Find the templates directory."""
+    # 1. Check installed location (~/.config/xtool-cli/templates)
+    installed_templates = Path.home() / ".config" / "xtool-cli" / "templates"
+    if installed_templates.exists():
+        return installed_templates
+
+    # 2. Check development location (same dir as script)
+    script_dir = Path(__file__).parent
+    dev_templates = script_dir / "templates"
+    if dev_templates.exists():
+        return dev_templates
+
+    # 3. Fallback to installed location
+    return installed_templates
+
+TEMPLATES_DIR = _find_templates_dir()
+XCODE_TEMPLATE_DIR = TEMPLATES_DIR / "xcode-project"
+XTOOL_TEMPLATE_DIR = TEMPLATES_DIR / "xtool-project"
+CONFIG_DIR = Path.home() / ".config" / "xtool-cli"
+CONFIG_FILE = CONFIG_DIR / "config.yaml"
+
+# Default configuration
+DEFAULT_CONFIG = {
+    'author': os.getenv("USER", "developer"),
+    'team_id': '',
+    'target_base_dir': str(Path.home() / "Documents" / "xtool-apps"),
+    'bundle_id_prefix': f"com.{os.getenv('USER', 'developer').lower()}",
+    'github': {
+        'create_by_default': False,
+        'private_by_default': False,
+    },
+    'xtool': {
+        'vphone_cid': 3,
+        'install_script': str(Path.home() / "Documents" / "vphone-linux" / "tools" / "install-ipa.py"),
+    }
+}
+
+def load_config() -> Dict:
+    """Load configuration from config file."""
+    config = DEFAULT_CONFIG.copy()
+
+    if CONFIG_FILE.exists() and HAS_YAML:
+        try:
+            with open(CONFIG_FILE) as f:
+                user_config = yaml.safe_load(f)
+                if user_config:
+                    # Deep merge
+                    for key, value in user_config.items():
+                        if key in config and isinstance(config[key], dict) and isinstance(value, dict):
+                            config[key].update(value)
+                        else:
+                            config[key] = value
+        except Exception as e:
+            print(f"Warning: Failed to load config: {e}", file=sys.stderr)
+
+    return config
+
+
+# Placeholder patterns
+PLACEHOLDERS = {
+    'APP_NAME': '{{APP_NAME}}',
+    'BUNDLE_ID': '{{BUNDLE_ID}}',
+    'AUTHOR': '{{AUTHOR}}',
+    'DATE': '{{DATE}}',
+    'TEAM_ID': '{{TEAM_ID}}',
+    # Xcode project UUIDs
+    'PROJECT_ID': '{{PROJECT_ID}}',
+    'MAIN_GROUP_ID': '{{MAIN_GROUP_ID}}',
+    'APP_GROUP_ID': '{{APP_GROUP_ID}}',
+    'PRODUCTS_GROUP_ID': '{{PRODUCTS_GROUP_ID}}',
+    'NATIVE_TARGET_ID': '{{NATIVE_TARGET_ID}}',
+    'BUILD_CONFIG_LIST_ID': '{{BUILD_CONFIG_LIST_ID}}',
+    'PROJECT_BUILD_CONFIG_LIST_ID': '{{PROJECT_BUILD_CONFIG_LIST_ID}}',
+    'SOURCES_BUILD_PHASE_ID': '{{SOURCES_BUILD_PHASE_ID}}',
+    'FRAMEWORKS_BUILD_PHASE_ID': '{{FRAMEWORKS_BUILD_PHASE_ID}}',
+    'RESOURCES_BUILD_PHASE_ID': '{{RESOURCES_BUILD_PHASE_ID}}',
+    'CONTENT_VIEW_FILE_REF_ID': '{{CONTENT_VIEW_FILE_REF_ID}}',
+    'APP_SWIFT_FILE_REF_ID': '{{APP_SWIFT_FILE_REF_ID}}',
+    'PROJECT_REF_ID': '{{PROJECT_REF_ID}}',
+    'APP_TARGET_REF_ID': '{{APP_TARGET_REF_ID}}',
+    'CONTENT_VIEW_BUILD_FILE_ID': '{{CONTENT_VIEW_BUILD_FILE_ID}}',
+    'APP_SWIFT_BUILD_FILE_ID': '{{APP_SWIFT_BUILD_FILE_ID}}',
+    'DEBUG_BUILD_CONFIG_ID': '{{DEBUG_BUILD_CONFIG_ID}}',
+    'RELEASE_BUILD_CONFIG_ID': '{{RELEASE_BUILD_CONFIG_ID}}',
+}
+
+
+def generate_uuid() -> str:
+    """Generate a 24-character UUID for Xcode project (based on UUID v4)."""
+    return uuid.uuid4().hex[:24].upper()
+
+
+def generate_all_uuids() -> Dict[str, str]:
+    """Generate all UUIDs needed for Xcode project."""
+    return {
+        'PROJECT_ID': generate_uuid(),
+        'MAIN_GROUP_ID': generate_uuid(),
+        'APP_GROUP_ID': generate_uuid(),
+        'PRODUCTS_GROUP_ID': generate_uuid(),
+        'NATIVE_TARGET_ID': generate_uuid(),
+        'BUILD_CONFIG_LIST_ID': generate_uuid(),
+        'PROJECT_BUILD_CONFIG_LIST_ID': generate_uuid(),
+        'SOURCES_BUILD_PHASE_ID': generate_uuid(),
+        'FRAMEWORKS_BUILD_PHASE_ID': generate_uuid(),
+        'RESOURCES_BUILD_PHASE_ID': generate_uuid(),
+        'CONTENT_VIEW_FILE_REF_ID': generate_uuid(),
+        'APP_SWIFT_FILE_REF_ID': generate_uuid(),
+        'PROJECT_REF_ID': generate_uuid(),
+        'APP_TARGET_REF_ID': generate_uuid(),
+        'CONTENT_VIEW_BUILD_FILE_ID': generate_uuid(),
+        'APP_SWIFT_BUILD_FILE_ID': generate_uuid(),
+        'DEBUG_BUILD_CONFIG_ID': generate_uuid(),
+        'RELEASE_BUILD_CONFIG_ID': generate_uuid(),
+    }
+
+
+def replace_placeholders(content: str, replacements: Dict[str, str]) -> str:
+    """Replace all placeholders in content with actual values."""
+    result = content
+    for key, value in replacements.items():
+        placeholder = PLACEHOLDERS.get(key, f'{{{{{key}}}}}')
+        result = result.replace(placeholder, value)
+    return result
+
+
+def process_template_file(src: Path, dst: Path, replacements: Dict[str, str]):
+    """Process a template file, replacing placeholders."""
+    content = src.read_text()
+    processed = replace_placeholders(content, replacements)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(processed)
+
+
+def copy_template_dir(src: Path, dst: Path, replacements: Dict[str, str],
+                      exclude_patterns: Optional[List[str]] = None):
+    """Recursively copy template directory, processing files."""
+    if exclude_patterns is None:
+        exclude_patterns = []
+
+    for item in src.rglob('*'):
+        if item.is_file():
+            # Check exclude patterns
+            rel_path = item.relative_to(src)
+            if any(re.match(pattern, str(rel_path)) for pattern in exclude_patterns):
+                continue
+
+            dst_file = dst / rel_path
+            process_template_file(item, dst_file, replacements)
+
+
+def run_command(cmd: List[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a command and return result."""
+    print(f"  $ {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        print(f"  Error: {result.stderr}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+    return result
+
+
+def create_xcode_project(app_name: str, bundle_id: str, author: str, team_id: str,
+                         target_dir: Path, replacements: Dict[str, str]) -> Path:
+    """Create Xcode project from template."""
+    print(f"Creating Xcode project: {app_name}")
+
+    xcode_project_dir = target_dir / f"{app_name}.xcodeproj"
+    xcode_sources_dir = target_dir / app_name
+
+    # Copy and process Xcode project template
+    copy_template_dir(
+        XCODE_TEMPLATE_DIR / "AppName.xcodeproj",
+        xcode_project_dir,
+        replacements,
+        exclude_patterns=[r'.*\.pbxproj$']  # Handle pbxproj separately
+    )
+
+    # Process the project.pbxproj file
+    pbxproj_src = XCODE_TEMPLATE_DIR / "AppName.xcodeproj" / "project.pbxproj"
+    pbxproj_dst = xcode_project_dir / "project.pbxproj"
+    process_template_file(pbxproj_src, pbxproj_dst, replacements)
+
+    # Copy and process source files
+    copy_template_dir(
+        XCODE_TEMPLATE_DIR / "AppName",
+        xcode_sources_dir,
+        replacements
+    )
+
+    # Rename the App.swift file to match app name
+    old_app_swift = xcode_sources_dir / f"{{{{APP_NAME}}}}App.swift"
+    new_app_swift = xcode_sources_dir / f"{app_name}App.swift"
+    if old_app_swift.exists():
+        old_app_swift.rename(new_app_swift)
+
+    return target_dir
+
+
+def create_xtool_project(app_name: str, bundle_id: str, xcode_project_dir: Path,
+                         xtool_dir: Path, replacements: Dict[str, str]) -> Path:
+    """Create xtool project with symlinks to Xcode project sources."""
+    print(f"Creating xtool project: {app_name}")
+
+    # Copy and process xtool template
+    copy_template_dir(XTOOL_TEMPLATE_DIR, xtool_dir, replacements)
+
+    # Make vrun.sh executable
+    vrun_path = xtool_dir / "vrun.sh"
+    if vrun_path.exists():
+        vrun_path.chmod(0o755)
+
+    # Create Sources directory structure
+    sources_dir = xtool_dir / "Sources" / app_name
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create symlinks to Xcode source files
+    xcode_sources = xcode_project_dir / app_name
+    content_view_src = xcode_sources / "ContentView.swift"
+    app_swift_src = xcode_sources / f"{app_name}App.swift"
+
+    if content_view_src.exists():
+        content_view_link = sources_dir / "ContentView.swift"
+        if content_view_link.exists() or content_view_link.is_symlink():
+            content_view_link.unlink()
+        content_view_link.symlink_to(content_view_src)
+        print(f"  Created symlink: ContentView.swift -> {content_view_src}")
+
+    if app_swift_src.exists():
+        app_swift_link = sources_dir / f"{app_name}App.swift"
+        if app_swift_link.exists() or app_swift_link.is_symlink():
+            app_swift_link.unlink()
+        app_swift_link.symlink_to(app_swift_src)
+        print(f"  Created symlink: {app_name}App.swift -> {app_swift_src}")
+
+    return xtool_dir
+
+
+def init_git_repo(project_dir: Path, app_name: str) -> bool:
+    """Initialize git repository and make initial commit."""
+    print(f"Initializing git repository...")
+
+    try:
+        # Initialize git
+        run_command(["git", "init"], cwd=project_dir)
+
+        # Create .gitignore
+        gitignore_content = """# Xcode
+*.xcworkspace
+xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/
+
+# Build
+build/
+DerivedData/
+
+# xtool
+.build/
+xtool/
+
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+"""
+        (project_dir / ".gitignore").write_text(gitignore_content)
+
+        # Add all files
+        run_command(["git", "add", "."], cwd=project_dir)
+
+        # Initial commit
+        run_command(["git", "commit", "-m", f"Initial commit: {app_name} iOS app with Xcode + xtool setup"], cwd=project_dir)
+
+        # Rename branch to main
+        run_command(["git", "branch", "-M", "main"], cwd=project_dir)
+
+        print(f"  Git repository initialized with initial commit")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  Error initializing git: {e}")
+        return False
+
+
+def push_to_target(project_dir: Path, target_dir: Path, app_name: str) -> bool:
+    """Push the repository to the target directory (bare repo)."""
+    print(f"Setting up target repository at {target_dir}...")
+
+    try:
+        # Create target directory if it doesn't exist
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check if target is already a git repo
+        target_git = target_dir / ".git"
+        if not target_git.exists():
+            # Initialize bare repository at target
+            run_command(["git", "init", "--bare"], cwd=target_dir)
+            print(f"  Created bare repository at target")
+
+        # Add target as remote
+        run_command(["git", "remote", "add", "origin", str(target_dir)], cwd=project_dir, check=False)
+        # If remote already exists, update it
+        run_command(["git", "remote", "set-url", "origin", str(target_dir)], cwd=project_dir)
+
+        # Push to target
+        run_command(["git", "push", "-u", "origin", "main"], cwd=project_dir)
+
+        print(f"  Pushed to target repository")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  Error pushing to target: {e}")
+        return False
+
+
+def create_github_repo(project_dir: Path, app_name: str, description: str, private: bool = False) -> Optional[str]:
+    """Create a GitHub repository using gh CLI."""
+    print(f"Creating GitHub repository...")
+
+    try:
+        visibility = "--private" if private else "--public"
+        result = run_command([
+            "gh", "repo", "create", app_name,
+            "--description", description,
+            visibility,
+            "--source", ".",
+            "--push"
+        ], cwd=project_dir, check=False)
+
+        if result.returncode == 0:
+            print(f"  GitHub repository created and pushed")
+            # Get the repo URL
+            url_result = run_command(["gh", "repo", "view", app_name, "--json", "url", "-q", ".url"],
+                                   cwd=project_dir)
+            return url_result.stdout.strip()
+        else:
+            print(f"  Note: GitHub repo creation skipped (gh CLI may not be configured)")
+            return None
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(f"  Note: GitHub repo creation skipped (gh CLI not available)")
+        return None
+
+
+def main():
+    # Load config first
+    config = load_config()
+
+    parser = argparse.ArgumentParser(
+        description="Create iOS app with Xcode + xtool + git automation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  xtool-create MyApp
+  xtool-create MyApp --bundle-id com.mycompany.myapp --author "John Doe"
+  xtool-create MyApp --team-id ABC1234567 --github --private
+  xtool-create MyApp --target-dir ~/Documents/xtool-apps/MyApp --no-github
+
+Config file: {CONFIG_FILE}
+        """
+    )
+
+    parser.add_argument("app_name", help="Name of the app (e.g., MyApp)")
+    parser.add_argument("--bundle-id", help=f"Bundle identifier (default: {config['bundle_id_prefix']}.<app_name>)")
+    parser.add_argument("--author", help=f"Author name (default: {config['author']})")
+    parser.add_argument("--team-id", help="Apple Developer Team ID")
+    parser.add_argument("--target-dir", help=f"Target directory (default: {config['target_base_dir']}/<AppName>)")
+    parser.add_argument("--github", action="store_true", help="Create GitHub repository")
+    parser.add_argument("--private", action="store_true", help="Make GitHub repo private")
+    parser.add_argument("--no-github", action="store_true", help="Skip GitHub repository creation")
+    parser.add_argument("--description", help="GitHub repository description")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be done without executing")
+
+    args = parser.parse_args()
+
+    # Validate app name
+    app_name = args.app_name.strip()
+    if not app_name:
+        print("Error: App name cannot be empty")
+        sys.exit(1)
+
+    # Sanitize app name for file system
+    safe_app_name = re.sub(r'[^\w\-]', '', app_name)
+    if safe_app_name != app_name:
+        print(f"Warning: App name sanitized to '{safe_app_name}'")
+        app_name = safe_app_name
+
+    # Set defaults from config
+    bundle_id = args.bundle_id or f"{config['bundle_id_prefix']}.{app_name.lower()}"
+    author = args.author or config['author']
+    team_id = args.team_id or config['team_id']
+    date = datetime.now().strftime("%Y-%m-%d")
+
+    # Target directory
+    if args.target_dir:
+        target_base = Path(args.target_dir).expanduser()
+    else:
+        target_base = Path(config['target_base_dir']).expanduser() / app_name
+
+    # Project directory (where we create the Xcode project)
+    project_dir = target_base
+
+    # xtool directory
+    xtool_dir = target_base.parent / f"{app_name}-xtool"
+
+    print(f"\n{'='*60}")
+    print(f"Creating iOS App: {app_name}")
+    print(f"{'='*60}")
+    print(f"Bundle ID: {bundle_id}")
+    print(f"Author: {author}")
+    print(f"Team ID: {team_id or '(not set)'}")
+    print(f"Project dir: {project_dir}")
+    print(f"xtool dir: {xtool_dir}")
+    print(f"{'='*60}\n")
+
+    if args.dry_run:
+        print("DRY RUN - No changes will be made")
+        return
+
+    # Prepare replacements
+    replacements = {
+        'APP_NAME': app_name,
+        'BUNDLE_ID': bundle_id,
+        'AUTHOR': author,
+        'DATE': date,
+        'TEAM_ID': team_id,
+    }
+    replacements.update(generate_all_uuids())
+
+    try:
+        # Step 1: Create Xcode project
+        create_xcode_project(app_name, bundle_id, author, team_id, project_dir, replacements)
+
+        # Step 2: Create xtool project with symlinks
+        create_xtool_project(app_name, bundle_id, project_dir, xtool_dir, replacements)
+
+        # Step 3: Initialize git repository
+        if not init_git_repo(project_dir, app_name):
+            print("Warning: Git initialization failed, continuing...")
+
+        # Step 4: Push to target directory (bare repo)
+        if not push_to_target(project_dir, target_base, app_name):
+            print("Warning: Push to target failed, continuing...")
+
+        # Step 5: Create GitHub repository (optional)
+        if args.github and not args.no_github:
+            desc = args.description or f"{app_name} iOS app with Xcode + xtool setup"
+            create_github_repo(project_dir, app_name, desc, args.private)
+
+        print(f"\n{'='*60}")
+        print(f"✅ Successfully created {app_name}!")
+        print(f"{'='*60}")
+        print(f"\nNext steps:")
+        print(f"  1. Open Xcode project: open {project_dir}/{app_name}.xcodeproj")
+        print(f"  2. Edit Swift files in: {project_dir}/{app_name}/")
+        print(f"  3. Run on vphone: cd {xtool_dir} && ./vrun.sh")
+        print(f"  4. Push changes: cd {project_dir} && git push")
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

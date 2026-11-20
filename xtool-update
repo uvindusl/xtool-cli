@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""
+xtool-update: Update xtool project for existing Xcode project
+
+This tool updates the xtool project structure and symlinks for an existing Xcode project.
+Useful when you add new Swift files to the Xcode project and want them linked in xtool.
+"""
+
+import os
+import sys
+import shutil
+import subprocess
+import argparse
+from pathlib import Path
+from typing import List
+
+def find_swift_files(project_dir: Path) -> List[Path]:
+    """Find all Swift files in the Xcode project source directory."""
+    # Look for the app source directory (same name as project)
+    for item in project_dir.iterdir():
+        if item.is_dir() and not item.name.endswith('.xcodeproj') and not item.name.startswith('.'):
+            return list(item.rglob('*.swift'))
+    return []
+
+def update_xtool_project(xcode_project_dir: Path, xtool_dir: Path, app_name: str, bundle_id: str):
+    """Update xtool project with current Swift files."""
+    print(f"Updating xtool project for {app_name}...")
+
+    # Find Swift files in Xcode project
+    swift_files = find_swift_files(xcode_project_dir)
+    if not swift_files:
+        print("  No Swift files found in Xcode project")
+        return
+
+    print(f"  Found {len(swift_files)} Swift file(s)")
+
+    # Create Sources directory
+    sources_dir = xtool_dir / "Sources" / app_name
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove old symlinks
+    for old_link in sources_dir.iterdir():
+        if old_link.is_symlink():
+            old_link.unlink()
+            print(f"  Removed old symlink: {old_link.name}")
+
+    # Create new symlinks
+    for swift_file in swift_files:
+        rel_path = swift_file.relative_to(xcode_project_dir)
+        link_path = sources_dir / swift_file.name
+        link_path.symlink_to(swift_file)
+        print(f"  Created symlink: {swift_file.name} -> {swift_file}")
+
+    # Update Package.swift if needed
+    package_swift = xtool_dir / "Package.swift"
+    if package_swift.exists():
+        content = package_swift.read_text()
+        # Ensure the path is correct
+        expected_path = f'path: "Sources/{app_name}"'
+        if expected_path not in content:
+            print("  Note: Package.swift may need manual update for new target structure")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Update xtool project for existing Xcode project",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  xtool-update ~/Documents/xtool-apps/MyApp
+  xtool-update ~/Documents/xtool-apps/MyApp --xtool-dir ~/Documents/xtool-apps/MyApp-xtool
+        """
+    )
+
+    parser.add_argument("xcode_project", help="Path to Xcode project directory")
+    parser.add_argument("--xtool-dir", help="Path to xtool project directory (default: <xcode_project>-xtool)")
+    parser.add_argument("--app-name", help="App name (default: inferred from directory)")
+    parser.add_argument("--bundle-id", help="Bundle ID (default: inferred)")
+
+    args = parser.parse_args()
+
+    xcode_project_dir = Path(args.xcode_project).expanduser().resolve()
+
+    if not xcode_project_dir.exists():
+        print(f"Error: Xcode project directory not found: {xcode_project_dir}")
+        sys.exit(1)
+
+    # Infer app name from directory
+    app_name = args.app_name or xcode_project_dir.name
+
+    # Infer xtool directory
+    if args.xtool_dir:
+        xtool_dir = Path(args.xtool_dir).expanduser().resolve()
+    else:
+        xtool_dir = xcode_project_dir.parent / f"{app_name}-xtool"
+
+    if not xtool_dir.exists():
+        print(f"Error: xtool directory not found: {xtool_dir}")
+        sys.exit(1)
+
+    # Infer bundle ID from xtool.yml
+    bundle_id = args.bundle_id
+    if not bundle_id:
+        xtool_yml = xtool_dir / "xtool.yml"
+        if xtool_yml.exists():
+            content = xtool_yml.read_text()
+            for line in content.split('\n'):
+                if line.startswith('bundleID:'):
+                    bundle_id = line.split(':', 1)[1].strip()
+                    break
+
+    if not bundle_id:
+        bundle_id = f"com.unknown.{app_name.lower()}"
+
+    print(f"Xcode project: {xcode_project_dir}")
+    print(f"xtool project: {xtool_dir}")
+    print(f"App name: {app_name}")
+    print(f"Bundle ID: {bundle_id}")
+
+    update_xtool_project(xcode_project_dir, xtool_dir, app_name, bundle_id)
+    print("Done!")
+
+if __name__ == "__main__":
+    main()
